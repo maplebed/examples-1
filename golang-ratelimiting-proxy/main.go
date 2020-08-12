@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,6 +16,9 @@ import (
 	"time"
 
 	beeline "github.com/honeycombio/beeline-go"
+	"github.com/honeycombio/beeline-go/propagation"
+	"github.com/honeycombio/beeline-go/trace"
+	"github.com/honeycombio/beeline-go/wrappers/config"
 	"github.com/honeycombio/beeline-go/wrappers/hnynethttp"
 	"github.com/honeycombio/leakybucket"
 )
@@ -29,7 +33,7 @@ import (
 
 const (
 	// downstreamTarget is who this proxy fronts
-	downstreamTarget = "http://localhost:8090"
+	downstreamTarget = "http://localhost:7000"
 
 	// the default limits for GET and all other requests
 	getBurstLimit        = 50
@@ -61,19 +65,28 @@ func main() {
 		WriteKey:    wk,
 		Dataset:     "beeline-example",
 		ServiceName: "rlp",
+
 		// In no writekey is configured, send the event to STDOUT instead of Honeycomb.
 		STDOUT: useStdout,
 	})
 
+	defaultTransport := &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout: 5 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout: 6 * time.Second,
+	}
+	wrapRTConfig := config.HTTPOutgoingConfig{
+		HTTPPropagationHook: func(req *http.Request, prop *propagation.PropagationContext) map[string]string {
+			return map[string]string{
+				"X-Amzn-Trace-Id": propagation.MarshalAmazonTraceContext(prop),
+			}
+		},
+	}
 	// create a custom client that has sane timeouts and records outbound events
 	client := &http.Client{
-		Timeout: time.Second * 10,
-		Transport: hnynethttp.WrapRoundTripper(&http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
-			}).Dial,
-			TLSHandshakeTimeout: 6 * time.Second,
-		}),
+		Timeout:   time.Second * 10,
+		Transport: hnynethttp.WrapRoundTripperWithConfig(defaultTransport, wrapRTConfig),
 	}
 
 	a := &app{
@@ -86,9 +99,13 @@ func main() {
 }
 
 func (a *app) proxy(w http.ResponseWriter, req *http.Request) {
+	curSpan := trace.GetSpanFromContext(req.Context())
+	ctx, span := curSpan.CreateAsyncChild(req.Context())
+	span.AddField("name", "extra span")
+	// defer span.Send() // whoops we forgot
 	var rateKey string
 	forwarded := req.Header.Get("X-Forwarded-For")
-	beeline.AddField(req.Context(), "forwarded_for_incoming", forwarded)
+	beeline.AddField(ctx, "forwarded_for_incoming", forwarded)
 	if forwarded == "" {
 		rateKey = strings.Split(req.RemoteAddr, ":")[0]
 	} else {
@@ -96,11 +113,11 @@ func (a *app) proxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// check rate limits
-	beeline.AddField(req.Context(), "rate_limit_key", rateKey)
-	hitCapacity := a.shouldRateLimit(req.Method, rateKey)
+	beeline.AddField(ctx, "rate_limit_key", rateKey)
+	hitCapacity := a.shouldRateLimit(ctx, req.Method, rateKey)
 	if hitCapacity != nil {
-		beeline.AddField(req.Context(), "error", "rate limit exceeded")
-		ctx, span := beeline.StartSpan(req.Context(), "wait")
+		beeline.AddField(ctx, "error", "rate limit exceeded")
+		ctx, span := beeline.StartSpan(ctx, "wait")
 		defer span.Send()
 		sleepTime := math.Abs(waitBaseTime + (rand.NormFloat64()*waitStdDev + waitRange))
 		beeline.AddField(ctx, "wait_time", sleepTime)
@@ -122,12 +139,12 @@ func (a *app) proxy(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		io.WriteString(w, `{"error":"failed to create downstream request"}`)
-		beeline.AddField(req.Context(), "error", err)
-		beeline.AddField(req.Context(), "error_detail", "failed to create downstream request")
+		beeline.AddField(ctx, "error", err)
+		beeline.AddField(ctx, "error_detail", "failed to create downstream request")
 		return
 	}
 	// add context to propagate the beeline trace
-	downstreamReq = downstreamReq.WithContext(req.Context())
+	downstreamReq = downstreamReq.WithContext(ctx)
 	// copy over headers from upstream to the downstream service
 	for header, vals := range req.Header {
 		downstreamReq.Header.Set(header, strings.Join(vals, ","))
@@ -137,14 +154,14 @@ func (a *app) proxy(w http.ResponseWriter, req *http.Request) {
 	} else {
 		downstreamReq.Header.Set("X-Forwarded-For", req.RemoteAddr)
 	}
-	beeline.AddField(req.Context(), "forwarded_for_outgoing", downstreamReq.Header.Get("X-Forwarded-For"))
+	beeline.AddField(ctx, "forwarded_for_outgoing", downstreamReq.Header.Get("X-Forwarded-For"))
 	// call the downstream service
 	resp, err := a.client.Do(downstreamReq)
 	if err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		io.WriteString(w, `{"error":"downstream target unavailable"}`)
-		beeline.AddField(req.Context(), "error", err)
-		beeline.AddField(req.Context(), "error_detail", "downstream target unavailable")
+		beeline.AddField(ctx, "error", err)
+		beeline.AddField(ctx, "error_detail", "downstream target unavailable")
 		return
 	}
 	// ok, we got a response, let's pass it along
@@ -159,13 +176,16 @@ func (a *app) proxy(w http.ResponseWriter, req *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-func (a *app) shouldRateLimit(method, key string) error {
+func (a *app) shouldRateLimit(ctx context.Context, method, key string) error {
+	ctx, span := beeline.StartSpan(ctx, "shouldRateLimit")
+	defer span.Send()
 	a.Lock()
 	defer a.Unlock()
 
 	var b *leakybucket.Bucket
 	b, ok := a.rateLimiter[method+key]
 	if !ok {
+		beeline.AddField(ctx, "createBucket", method)
 		if method == "GET" {
 			b = &leakybucket.Bucket{
 				Capacity:    getBurstLimit,
