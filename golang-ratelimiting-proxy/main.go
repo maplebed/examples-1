@@ -32,8 +32,8 @@ import (
 // etc.).
 
 const (
-	// downstreamTarget is who this proxy fronts
-	downstreamTarget = "http://localhost:7000"
+	// defaultDownstreamTarget is who this proxy fronts
+	defaultDownstreamTarget = "http://localhost:7000"
 
 	// the default limits for GET and all other requests
 	getBurstLimit        = 50
@@ -46,6 +46,8 @@ const (
 	waitRange    = 500.0
 	waitStdDev   = 100.0
 )
+
+var downstreamTarget = "http://localhost:7000"
 
 type app struct {
 	client      *http.Client
@@ -60,11 +62,23 @@ func main() {
 	if wk == "" {
 		useStdout = true
 	}
+
+	// optionally get the listen port and downstream target from the environment
+	port := os.Getenv("HONEYCOMB_LISTEN_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	dsTarget := os.Getenv("HONEYCOMB_DOWNSTREAM_TARGET")
+	if dsTarget == "" {
+		dsTarget = defaultDownstreamTarget
+	}
+	downstreamTarget = dsTarget
+
 	// Initialize beeline. The only required field is WriteKey.
 	beeline.Init(beeline.Config{
 		WriteKey:    wk,
 		Dataset:     "beeline-example",
-		ServiceName: "rlp",
+		ServiceName: "rlp-" + port,
 
 		// In no writekey is configured, send the event to STDOUT instead of Honeycomb.
 		STDOUT: useStdout,
@@ -78,6 +92,9 @@ func main() {
 	}
 	wrapRTConfig := config.HTTPOutgoingConfig{
 		HTTPPropagationHook: func(req *http.Request, prop *propagation.PropagationContext) map[string]string {
+			if existingHeader := req.Header.Get("X-Amzn-Trace-Id"); existingHeader != "" {
+				req.Header.Del("X-Amzn-Trace-Id")
+			}
 			return map[string]string{
 				"X-Amzn-Trace-Id": propagation.MarshalAmazonTraceContext(prop),
 			}
@@ -94,15 +111,26 @@ func main() {
 		rateLimiter: make(map[string]*leakybucket.Bucket),
 	}
 
-	http.HandleFunc("/", hnynethttp.WrapHandlerFunc(a.proxy))
-	log.Fatal(http.ListenAndServe("localhost:8080", nil))
+	wrapHandlerConfig := config.HTTPIncomingConfig{
+		HTTPParserHook: func(r *http.Request) *propagation.PropagationContext {
+			propHeader := r.Header.Get("X-Amzn-Trace-Id")
+			prop, _ := propagation.UnmarshalAmazonTraceContext(propHeader)
+			return prop
+		},
+	}
+	http.Handle("/", hnynethttp.WrapHandlerWithConfig(a, wrapHandlerConfig))
+	log.Fatal(http.ListenAndServe("localhost:"+port, nil))
 }
 
+func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	a.proxy(w, r)
+	return
+}
 func (a *app) proxy(w http.ResponseWriter, req *http.Request) {
 	curSpan := trace.GetSpanFromContext(req.Context())
 	ctx, span := curSpan.CreateAsyncChild(req.Context())
 	span.AddField("name", "extra span")
-	// defer span.Send() // whoops we forgot
+	defer span.Send() // whoops we forgot
 	var rateKey string
 	forwarded := req.Header.Get("X-Forwarded-For")
 	beeline.AddField(ctx, "forwarded_for_incoming", forwarded)
