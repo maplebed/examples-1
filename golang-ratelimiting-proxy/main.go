@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -21,6 +22,8 @@ import (
 	"github.com/honeycombio/beeline-go/wrappers/config"
 	"github.com/honeycombio/beeline-go/wrappers/hnynethttp"
 	"github.com/honeycombio/leakybucket"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 // rate limiting proxy is a forwarding proxy that has a built in rate limit. In
@@ -57,6 +60,11 @@ type app struct {
 
 func main() {
 
+	ds := os.Getenv("HONEYCOMB_DATASET")
+	if ds == "" {
+		ds = "ratelimitingproxy"
+	}
+
 	wk := os.Getenv("HONEYCOMB_APIKEY")
 	var useStdout bool
 	if wk == "" {
@@ -77,8 +85,9 @@ func main() {
 	// Initialize beeline. The only required field is WriteKey.
 	beeline.Init(beeline.Config{
 		WriteKey:    wk,
-		Dataset:     "beeline-example",
+		Dataset:     ds,
 		ServiceName: "rlp-" + port,
+		APIHost:     "https://api-dogfood.honeycomb.io",
 
 		// In no writekey is configured, send the event to STDOUT instead of Honeycomb.
 		STDOUT: useStdout,
@@ -95,9 +104,19 @@ func main() {
 			if existingHeader := req.Header.Get("X-Amzn-Trace-Id"); existingHeader != "" {
 				req.Header.Del("X-Amzn-Trace-Id")
 			}
-			return map[string]string{
-				"X-Amzn-Trace-Id": propagation.MarshalAmazonTraceContext(prop),
+			retHeaders := map[string]string{
+				"X-Amzn-Trace-Id":   propagation.MarshalAmazonTraceContext(prop),
+				"X-Honeycomb-Trace": propagation.MarshalHoneycombTraceContext(prop),
 			}
+			_, w3cHeaders := propagation.MarshalW3CTraceContext(req.Context(), prop)
+			for k, v := range w3cHeaders {
+				retHeaders[k] = v
+			}
+			fmt.Printf("Outgoing headers:\n")
+			for k, v := range retHeaders {
+				fmt.Printf("\t%s\t%s\n", k, v)
+			}
+			return retHeaders
 		},
 	}
 	// create a custom client that has sane timeouts and records outbound events
@@ -112,14 +131,30 @@ func main() {
 	}
 
 	wrapHandlerConfig := config.HTTPIncomingConfig{
-		HTTPParserHook: func(r *http.Request) *propagation.PropagationContext {
+		HTTPParserHook: func(r *http.Request) (prop *propagation.PropagationContext) {
 			propHeader := r.Header.Get("X-Amzn-Trace-Id")
-			prop, _ := propagation.UnmarshalAmazonTraceContext(propHeader)
+			if propHeader != "" {
+				prop, _ = propagation.UnmarshalAmazonTraceContext(propHeader)
+				spew.Dump(prop)
+				return prop
+			}
+			propHeader = r.Header.Get("X-Honeycomb-Trace")
+			if propHeader != "" {
+				prop, _ = propagation.UnmarshalHoneycombTraceContext(propHeader)
+				spew.Dump(prop)
+				return prop
+			}
+			headrs := map[string]string{
+				"traceparent": r.Header.Get("traceparent"),
+			}
+			_, prop, _ = propagation.UnmarshalW3CTraceContext(r.Context(), headrs)
+			spew.Dump(prop)
 			return prop
+
 		},
 	}
 	http.Handle("/", hnynethttp.WrapHandlerWithConfig(a, wrapHandlerConfig))
-	log.Fatal(http.ListenAndServe("localhost:"+port, nil))
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
 }
 
 func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
